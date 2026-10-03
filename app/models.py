@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Literal, Optional
 
@@ -80,6 +81,28 @@ class EvaluationCreate(BaseModel):
     )
 
 
+class PrecisionTarget(BaseModel):
+    """精度反求目标：带单位的非负有限 GUM 合成标准不确定度上界。"""
+
+    standard_uncertainty: float = Field(description="目标 GUM 合成标准不确定度（必须为非负有限值）")
+    unit: str = Field(min_length=1, max_length=64, description="目标值单位（须与模型输出量纲一致）")
+
+    @field_validator("standard_uncertainty")
+    @classmethod
+    def _non_negative_finite(cls, v: float) -> float:
+        if not math.isfinite(v) or v < 0.0:
+            raise ValueError("目标标准不确定度必须是非负有限数（不接受 NaN/Inf/负值）")
+        return v
+
+
+class PrecisionBudgetCreate(BaseModel):
+    """测量精度反求请求：只变动一个已登记输入的标准不确定度。"""
+
+    model_version: str = Field(min_length=1, max_length=128)
+    input_name: str = Field(min_length=1, max_length=64)
+    target: PrecisionTarget
+
+
 __all__ = [
     "Distribution",
     "InputSpec",
@@ -87,5 +110,7 @@ __all__ = [
     "ModelCreate",
     "SnapshotInput",
     "EvaluationCreate",
+    "PrecisionTarget",
+    "PrecisionBudgetCreate",
     "DISTRIBUTIONS",
 ]

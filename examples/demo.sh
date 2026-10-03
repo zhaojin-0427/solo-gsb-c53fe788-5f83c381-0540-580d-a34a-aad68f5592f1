@@ -60,3 +60,41 @@ curl -sS -X POST "$BASE/api/v1/evaluations" -H 'Content-Type: application/json' 
 echo "== 4. 查询 =="
 curl -fsS "$BASE/api/v1/idempotency/demo-power-0001" -o /dev/null -w "by key: HTTP %{http_code}\n"
 curl -fsS "$BASE/api/v1/models/power-dc-v1" -o /dev/null -w "model  : HTTP %{http_code}\n"
+
+echo "== 5. 精度反求（POST /api/v1/precision-budgets，只读）=="
+# 登记负相关线性模型 y=a+b（r=-1, ub=2）；反求目标 uc(y)<=1 时 ua 的可行区间，理论 [1,3]
+curl -sS -X POST "$BASE/api/v1/models" -H 'Content-Type: application/json' -d '{
+  "version": "budget-sum-rm1",
+  "name": "线性和 y=a+b（负相关反求示例）",
+  "expression": "a + b",
+  "inputs": [
+    {"name": "a", "value": 3.0, "unit": "dimensionless", "standard_uncertainty": 0.1, "distribution": "normal"},
+    {"name": "b", "value": 5.0, "unit": "dimensionless", "standard_uncertainty": 2.0, "distribution": "normal"}
+  ],
+  "output_unit": "dimensionless",
+  "correlations": [{"i": "a", "j": "b", "r": -1.0}]
+}' -o /dev/null -w "model  : HTTP %{http_code}\n" || true
+
+curl -sS -X POST "$BASE/api/v1/precision-budgets" -H 'Content-Type: application/json' -d '{
+  "model_version": "budget-sum-rm1",
+  "input_name": "a",
+  "target": {"standard_uncertainty": 1.0, "unit": "dimensionless"}
+}' -o /tmp/budget_resp.json -w "budget : HTTP %{http_code}\n"
+
+python3 - <<'PY'
+import json
+d = json.load(open('/tmp/budget_resp.json'))
+iv = d["interval"]
+if iv["feasible"]:
+    lo = ("[" if iv["lower_inclusive"] else "(") + str(iv["lower"])
+    hi = ("∞" if iv["upper"] is None else str(iv["upper"])) + ("]" if iv["upper_inclusive"] else ")")
+    print(f"可行 ua 区间: {lo}, {hi}  （理论 [1, 3]，负相关双侧有界）")
+else:
+    print("可行区间为空（目标无法达到）")
+print("当前登记值是否达标:", d["satisfied"],
+      "| 当前 uc(y) =", d["current_combined_standard_uncertainty"]["value"])
+PY
+
+echo "== 6. 反求不写计算记录（计数不因第 5 步增加）=="
+curl -fsS "$BASE/api/v1/evaluations?model_version=budget-sum-rm1" \
+  | python3 -c 'import json,sys; print("budget-sum-rm1 的计算记录数:", json.load(sys.stdin)["count"])'

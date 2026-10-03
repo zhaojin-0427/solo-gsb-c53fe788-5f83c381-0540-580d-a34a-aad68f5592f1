@@ -12,16 +12,20 @@ from decimal import Decimal, localcontext
 from typing import Any
 
 import numpy as np
+import pint
 
 from . import storage
 from .engine import (
+    _EPS,
+    _EPS13,
     build_correlation_matrix,
+    numerical_gradient,
     run_gum,
     run_monte_carlo,
 )
-from .errors import ConflictError, ModelError, RequestError
+from .errors import ConflictError, ModelError, PropagationError, RequestError
 from .expressions import compile_expression
-from .models import EvaluationCreate, ModelCreate
+from .models import EvaluationCreate, ModelCreate, PrecisionBudgetCreate
 from .units import build_unit_context, format_dimensionality, get_registry, parse_unit, to_declared_magnitude
 
 #: 模型版本 -> (CompiledExpression, UnitContext)；登记时构建，进程内复用
@@ -422,3 +426,243 @@ def _f(x: Any) -> float:
     with localcontext() as ctx:
         ctx.prec = 15
         return float(+Decimal(v))
+
+
+# ---------------------------------------------------------------------------
+# 测量精度反求（precision budget）
+# ---------------------------------------------------------------------------
+
+#: 名义点灵敏度判定为“零”的相对阈值（线性无关输入如 2*(a-a) 恰为 0）
+_ZERO_SENSITIVITY_REL = 1e-12
+
+
+def _unit_label(spec: str) -> str:
+    """pint 紧凑格式把无量纲单位渲染成空串；响应文本统一显示为 ``dimensionless``。"""
+    return "dimensionless" if spec == "" else spec
+
+
+def solve_precision_budget(req: PrecisionBudgetCreate) -> dict[str, Any]:
+    """反求单个输入标准不确定度的可行区间，使 GUM 合成标准不确定度不超过目标。
+
+    只读不可变模型，不改模型、不写任何计算记录：
+
+    * 沿用登记时的单位换算与量纲校验（目标单位须与输出量纲一致）；
+    * 沿用登记模型的相关矩阵（重新走同一套半正定校验）；
+    * 沿用 GUM 名义点灵敏度（同一套中心差分）；
+    * 仅令被求输入 k 的标准差 u 自由变化（u ≥ 0），其余输入保持登记值。
+
+    合成方差关于 u 是二次函数（协方差全部纳入，含负相关项）：
+
+        v(u) = C + B·u + A·u²
+
+        A = g_k²
+        B = 2·g_k·Σ_{j≠k} g_j·ρ_kj·s_j
+        C = Σ_{i≠k}Σ_{j≠k} g_i g_j Cov(i,j)
+
+    （g、s 均在基本单位空间；目标平方先换算到输出方差空间再除以
+    output_scale²。）求解 v(u) ≤ t²、u ≥ 0 的区间，并把端点换算回
+    该输入的**声明单位**。
+    """
+    record = storage.get_model(req.model_version)  # 未知版本 -> 404
+    compiled, ctx = _get_context(req.model_version)
+
+    names = tuple(s["name"] for s in record["inputs"])
+    if req.input_name not in names:
+        raise RequestError(
+            f"输入 {req.input_name!r} 未在模型版本 {req.model_version!r} 中登记，可选: {list(names)}"
+        )
+    k = names.index(req.input_name)
+
+    # 1. 目标单位换算与量纲校验（与输出声明单位量纲一致）
+    out_unit = parse_unit(record["output_unit"])
+    target_out = _target_to_output(
+        req.target.unit, req.target.standard_uncertainty, out_unit, record["output_unit"]
+    )
+    t_base_sq = (target_out / ctx.output_scale) ** 2
+    # 2. 名义点（声明单位 -> 基本单位）与 GUM 名义点灵敏度
+    x_decl = {s["name"]: s["value"] for s in record["inputs"]}
+    std_decl = {s["name"]: s["standard_uncertainty"] for s in record["inputs"]}
+    x_base = ctx.nominal_to_base(x_decl)
+    std_base = np.array([ctx.std_to_base(std_decl)[name] for name in names], dtype=float)
+
+    zero_std = {name for name in names if std_decl[name] == 0.0}
+    corr = build_correlation_matrix(
+        names, [(t[0], t[1], float(t[2])) for t in record["correlations"]], zero_std
+    )
+
+    grad = numerical_gradient(compiled, x_base, names)
+    if not np.all(np.isfinite(grad)):
+        raise PropagationError("名义点邻域产生了非有限结果（NaN/Inf），无法进行精度反求")
+
+    gk = float(grad[k])
+
+    # 当前登记预算下的合成方差（与 GUM 传播同一二次型）与当前标准不确定度
+    cov_cur = std_base[:, None] * corr * std_base[None, :]
+    cur_var_base = float(grad @ cov_cur @ grad)
+    cur_uc_out = ctx.output_scale * math.sqrt(max(cur_var_base, 0.0))
+
+    # 3. 二次型系数（u 为输入 k 的标准差，基本单位空间）
+    A = gk * gk
+    other = [j for j in range(len(names)) if j != k]
+    B = 2.0 * gk * float(sum(grad[j] * corr[k, j] * std_base[j] for j in other))
+    C = float(sum(
+        grad[i] * grad[j] * std_base[i] * std_base[j] * corr[i, j]
+        for i in other for j in other
+    ))
+    # 浮点噪声钳位（与 run_gum 同尺度思想：C 理论上是 PSD 二次型，≥0）
+    cov0_scale = float(sum(
+        abs(grad[i] * grad[j] * std_base[i] * std_base[j] * corr[i, j])
+        for i in other for j in other
+    ))
+    c_floor = _EPS * max(1.0, len(names)) * cov0_scale
+    if -c_floor <= C <= 0.0:
+        C = 0.0
+
+    # 4. 端点（先在基本单位空间求解）
+    grad_scale = float(np.max(np.abs(grad))) if len(grad) else 0.0
+    zero_g = gk == 0.0 or abs(gk) <= _ZERO_SENSITIVITY_REL * max(grad_scale, _EPS13)
+    # 与 k 相关（登记矩阵中存在边）时，u=0 端点无效：相关系数在零方差处无定义
+    correlated = any(names[k] in (t[0], t[1]) for t in record["correlations"])
+
+    empty = False
+    unbounded = False
+    lo_base = hi_base = 0.0
+    lo_open = hi_open = False
+
+    if zero_g:
+        # 输入 k 对输出零灵敏度：方差与 u 无关 => 可行时无上限，否则空区间
+        if C > t_base_sq + c_floor:
+            empty = True
+        else:
+            unbounded = True
+            lo_open = correlated  # 相关输入的零端点无效 => 开
+    else:
+        disc = B * B - 4.0 * A * (C - t_base_sq)
+        # 舍入误差级负判别式（理论相切）钳为 0
+        disc_scale = max(abs(B * B), abs(4.0 * A * (C - t_base_sq)), 1e-300)
+        if disc < 0.0 and disc >= -_EPS * max(1.0, len(names)) * disc_scale:
+            disc = 0.0
+        if disc < 0.0:
+            # v(u) 恒大于目标平方（开口向上且无实根）=> 无论 u 取何值都无法达标
+            empty = True
+        else:
+            # 实根存在：可行域为 [u_-, u_+] 与 u ≥ 0 的交
+            root_eps = _EPS13 * max(math.sqrt(max(disc, 0.0)) / (2.0 * A),
+                                    abs(B) / (2.0 * A), _EPS13)
+            u_minus = (-B - math.sqrt(max(disc, 0.0))) / (2.0 * A)
+            u_plus = (-B + math.sqrt(max(disc, 0.0))) / (2.0 * A)
+            if u_plus < -root_eps:
+                empty = True  # 整个可行区间落在 u < 0（理论上 B≤0 时不应发生，防御式）
+            else:
+                # 与 u ≥ 0 取交
+                if abs(u_minus) <= root_eps:
+                    u_minus = 0.0
+                if abs(u_plus) <= root_eps:
+                    u_plus = 0.0
+                lo_base = max(u_minus, 0.0)
+                hi_base = max(u_plus, 0.0)
+                lo_open = correlated and lo_base == 0.0  # 相关输入的零端点无效 => 开
+                # 二次方程根端点恒可取（闭）
+                # 相切（u_- == u_+）时浮点可能给出极窄区间，塌缩为单点
+                if 0.0 < lo_base <= hi_base and hi_base - lo_base <= 2.0 * root_eps:
+                    mid = 0.5 * (lo_base + hi_base)
+                    lo_base = hi_base = mid
+                # 唯一候选 u=0 又因相关而无效 => 可行集为空（如 r=+1 相切于原点）
+                if hi_base == 0.0 and lo_open:
+                    empty = True
+                    lo_open = False
+
+    # 5. 端点换算回输入声明单位
+    input_record = next(s for s in record["inputs"] if s["name"] == req.input_name)
+    decl_unit_spec = input_record["unit"]
+    factor = ctx.base_factors[req.input_name]  # 1 声明单位 = factor 个基本单位
+
+    interval: dict[str, Any]
+    if empty:
+        interval = {
+            "feasible": False,
+            "lower": None,
+            "lower_inclusive": False,
+            "upper": None,
+            "upper_inclusive": False,
+            "unbounded_upper": False,
+        }
+    elif unbounded:
+        interval = {
+            "feasible": True,
+            "lower": 0.0,
+            "lower_inclusive": not lo_open,
+            "upper": None,
+            "upper_inclusive": False,
+            "unbounded_upper": True,
+        }
+    else:
+        lo_decl = _tidy(lo_base / factor)
+        hi_decl = _tidy(hi_base / factor)
+        if lo_decl > hi_decl:  # 舍入倒置保护
+            hi_decl = lo_decl
+        interval = {
+            "feasible": True,
+            "lower": _f(lo_decl),
+            "lower_inclusive": not lo_open,
+            "upper": _f(hi_decl),
+            "upper_inclusive": not hi_open,
+            "unbounded_upper": False,
+        }
+
+    # 6. 当前登记值是否达标（尺度相关容差，与 GUM 钳零思想一致）
+    meet_tol = _EPS ** 0.5 * max(cur_uc_out, target_out, 0.0)
+    satisfied = cur_var_base >= 0.0 and cur_uc_out <= target_out + meet_tol
+
+    sensitivity_out = ctx.sensitivity(req.input_name, gk)
+    out_label = _unit_label(record["output_unit"])
+    in_label = _unit_label(decl_unit_spec)
+    return {
+        "model_version": req.model_version,
+        "input_name": req.input_name,
+        "input_unit": in_label,
+        "target": {
+            "standard_uncertainty": _f(req.target.standard_uncertainty),
+            "unit": _unit_label(req.target.unit),
+        },
+        "target_in_output_unit": {
+            "standard_uncertainty": _f(target_out),
+            "unit": out_label,
+        },
+        "sensitivity": {
+            "coefficient": _f(sensitivity_out),
+            "unit": f"{out_label}/{in_label}",
+        },
+        "current_standard_uncertainty": {
+            "value": _f(input_record["standard_uncertainty"]),
+            "unit": in_label,
+        },
+        "current_combined_standard_uncertainty": {
+            "value": _f(cur_uc_out),
+            "unit": out_label,
+        },
+        "satisfied": bool(satisfied),
+        "interval": interval,
+    }
+
+
+def _target_to_output(unit_spec: str, value: float, out_unit: pint.Unit, out_spec: str) -> float:
+    """把目标值换算到模型输出声明单位；量纲不符 -> 422。"""
+    reg = get_registry()
+    src = parse_unit(unit_spec)
+    try:
+        q = reg.Quantity(float(value), src).to(out_unit)
+    except pint.errors.DimensionalityError as exc:
+        raise RequestError(
+            f"目标单位 {unit_spec!r} 与模型输出单位 {out_spec!r} 量纲不兼容"
+        ) from exc
+    return float(q.magnitude)
+
+
+def _tidy(v: float) -> float:
+    """清理 -0.0 与舍入产生的微小负值（端点理论上非负）。"""
+    if v == 0.0:
+        return 0.0
+    if abs(v) <= _EPS13 * max(1.0, abs(v)):
+        return 0.0
+    return max(v, 0.0)

@@ -13,6 +13,8 @@
 
 请求按 `模型版本 + 输入快照 + N + 种子 + 收敛容差 + 幂等键` 绑定，重复提交只返回同一结果。
 
+此外提供只读的 **测量精度反求接口** `POST /api/v1/precision-budgets`：给定已登记模型、单个待调整输入与带单位的非负目标 GUM 合成标准不确定度，在不改模型、不写计算记录的前提下，反解该输入标准不确定度（含全部协方差/负相关项）的可行区间，详见 [第 9 节](#9-测量精度反求precision-budgets)。
+
 ---
 
 ## 目录
@@ -29,6 +31,7 @@
   - [6. 拒绝场景示例](#6-拒绝场景示例)
   - [7. 完全相关（r = ±1，奇异半正定矩阵）](#7-完全相关r--1奇异半正定矩阵)
   - [8. 小量级标准不确定度（1e-9，真实方差不得归零）](#8-小量级标准不确定度1e-9真实方差不得归零)
+  - [9. 测量精度反求（precision-budgets）](#9-测量精度反求precision-budgets)
 - [模型表达式白名单](#模型表达式白名单)
 - [分布与相关系数](#分布与相关系数)
 - [结果字段说明](#结果字段说明)
@@ -86,6 +89,7 @@ python run.py                 # 或 uvicorn app.main:app --reload --port 8000
 | GET | `/api/v1/evaluations/{id}` | 按结果 ID 查询 |
 | GET | `/api/v1/evaluations?model_version=` | 列出计算结果（可按模型版本过滤） |
 | GET | `/api/v1/idempotency/{key}` | 按幂等键查询 |
+| POST | `/api/v1/precision-budgets` | 测量精度反求：反解单个输入标准不确定度的可行区间（只读，200） |
 | GET | `/health` | 健康检查 |
 
 ## 完整示例
@@ -252,6 +256,8 @@ curl -sS http://localhost:8000/api/v1/idempotency/demo-power-0001
 | 蒙特卡洛不收敛 | 422 | `ConvergenceError: 蒙特卡洛 N=1000 未通过收敛判据 ...` |
 | 抽样越过模型定义域（如对正态量取 sqrt/log 产生 NaN） | 422 | `PropagationError: 蒙特卡洛抽样中模型产生了 k/N 个非有限结果 ...` |
 | 幂等键绑定到不同请求 / 模型版本重复 | 409 | `ConflictError` |
+| 精度反求：未知模型版本 | 404 | `NotFoundError: 模型版本 ... 不存在`（见 [9.4](#94-拒绝场景)） |
+| 精度反求：未知输入名 / 目标量纲不符 / 目标负值或非有限 | 422 | `RequestError` / Pydantic 校验错误（见 [9.4](#94-拒绝场景)） |
 
 ### 7. 完全相关（r = ±1，奇异半正定矩阵）
 
@@ -541,6 +547,179 @@ curl -sS http://localhost:8000/api/v1/idempotency/doc-tiny-r1-0001              
  "status_code": 422}
 ```
 
+### 9. 测量精度反求（precision-budgets）
+
+`POST /api/v1/precision-budgets` 是**只读**的 GUM 一阶反求接口：客户端提交**已登记模型版本**、**待调整的单个输入名**和**带单位的非负目标 GUM 合成标准不确定度**；服务读取不可变模型，沿用登记时的单位换算/量纲校验、相关矩阵校验与名义点（中心差分）灵敏度，**仅变动该输入的标准不确定度 u（u ≥ 0）**，其余输入保持登记值，反解
+
+```
+u_c²(y) = Σ gᵢgⱼCov(i,j) ≤ 目标²
+```
+
+的可行 u 区间。合成方差关于 u 是二次函数（在基本单位空间）：
+
+```
+v(u) = C + B·u + A·u²,   A = g_k²,  B = 2·g_k·Σ_{j≠k} g_j·ρ_kj·s_j,  C = Σ_{i≠k,j≠k} g_i g_j Cov(i,j)
+```
+
+**所有协方差项（含负相关）都纳入二次不等式。** 响应给出：
+
+* `interval.lower` / `interval.upper`：输入**声明单位**下的端点（`upper` 为 `null` 表示无上限）；
+* `interval.lower_inclusive` / `interval.upper_inclusive`：端点开闭性；
+* `interval.feasible`：`false` 时为空区间（两端点均为 `null`）；
+* `satisfied`：该输入**当前登记**的标准不确定度下，合成标准不确定度是否已达标。
+
+该接口**不修改模型、不写入任何计算记录、不占用幂等键**，可安全重复调用；原有传播、幂等与查询接口不受影响。
+
+#### 9.1 负相关不能误算成单一上限（核心示例）
+
+无量纲线性模型 `y = a + b`（a = 3.0(10)，b = 5.0(20)，r = **−1**）：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/models \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "budget-sum-rm1",
+    "name": "线性和 y=a+b（负相关反求示例）",
+    "expression": "a + b",
+    "inputs": [
+      {"name": "a", "value": 3.0, "unit": "dimensionless", "standard_uncertainty": 0.1, "distribution": "normal"},
+      {"name": "b", "value": 5.0, "unit": "dimensionless", "standard_uncertainty": 2.0, "distribution": "normal"}
+    ],
+    "output_unit": "dimensionless",
+    "correlations": [{"i": "a", "j": "b", "r": -1.0}]
+  }'
+```
+
+要求合成标准不确定度不超过 1（反求 a）：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/precision-budgets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_version": "budget-sum-rm1",
+    "input_name": "a",
+    "target": {"standard_uncertainty": 1.0, "unit": "dimensionless"}
+  }'
+```
+
+返回 `200`（以下为**实际响应**）：
+
+```json
+{
+  "model_version": "budget-sum-rm1",
+  "input_name": "a",
+  "input_unit": "dimensionless",
+  "target": {"standard_uncertainty": 1.0, "unit": "dimensionless"},
+  "target_in_output_unit": {"standard_uncertainty": 1.0, "unit": "dimensionless"},
+  "sensitivity": {"coefficient": 1.000000000023553, "unit": "dimensionless/dimensionless"},
+  "current_standard_uncertainty": {"value": 0.1, "unit": "dimensionless"},
+  "current_combined_standard_uncertainty": {"value": 1.900000000015417, "unit": "dimensionless"},
+  "satisfied": false,
+  "interval": {
+    "feasible": true,
+    "lower": 0.999999999994219,
+    "lower_inclusive": true,
+    "upper": 2.999999999947113,
+    "upper_inclusive": true,
+    "unbounded_upper": false
+  }
+}
+```
+
+> 理论上 v(u) = (u − 2)² ≤ 1，即 **ua ∈ [1, 3]**——是一个两侧有界的闭区间，而不是 `[0, 3]` 之类的单一上限（那等价于丢掉负相关的线性项 B·u）。响应端点与 1/3 的 4e-12 级偏差来自中心差分灵敏度（∂y/∂a≈1.000000000024，与 [第 7 节](#7-完全相关r--1奇异半正定矩阵) GUM 偏差同源），不是区间逻辑误差。当前 ua=0.1 时 uc=1.9，故 `satisfied=false`。
+
+#### 9.2 带单位目标 + 相关输入的零端点开区间
+
+以直流功率 `P = U·I`（r(U,I)=0.5，U=10.0(10) V，I=2.00(2) A）为例，要求 u(P) ≤ 0.5 W（反求 U，目标单位直接写 `W`）：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/precision-budgets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_version": "power-dc-v1",
+    "input_name": "U",
+    "target": {"standard_uncertainty": 0.5, "unit": "W"}
+  }'
+```
+
+返回 `200`（**实际响应**）：
+
+```json
+{
+  "model_version": "power-dc-v1",
+  "input_name": "U",
+  "input_unit": "V",
+  "target": {"standard_uncertainty": 0.5, "unit": "W"},
+  "target_in_output_unit": {"standard_uncertainty": 0.5, "unit": "W"},
+  "sensitivity": {"coefficient": 1.999999999988437, "unit": "W/V"},
+  "current_standard_uncertainty": {"value": 0.1, "unit": "V"},
+  "current_combined_standard_uncertainty": {"value": 0.346410161511773, "unit": "W"},
+  "satisfied": true,
+  "interval": {
+    "feasible": true,
+    "lower": 0.0,
+    "lower_inclusive": false,
+    "upper": 0.184520787992712,
+    "upper_inclusive": true,
+    "unbounded_upper": false
+  }
+}
+```
+
+可行区间是 **(0, 0.18452…] V**：
+
+* **低端点 0 标为开**（`lower_inclusive=false`）——U 与 I 在登记模型中有相关系数，而相关系数在零标准不确定度处无定义（登记/传播管线本就拒绝引用 u=0 的相关对，见 [拒绝场景](#6-拒绝场景示例)），因此 u=0 不是可行点；
+* 上端点是二次方程根，恒为闭；
+* 目标也可用量纲等价单位提交（如 `target.unit="mW"`、`standard_uncertainty=500`），`target_in_output_unit` 给出换算到模型输出单位后的值，端点仍在输入声明单位（V）下。
+
+若目标定得过紧（如 0.2 W）：可行域的数学根退化为只含 u=0，而该零端点对相关输入无效，返回**空区间**：
+
+```json
+"interval": {"feasible": false, "lower": null, "lower_inclusive": false,
+             "upper": null, "upper_inclusive": false, "unbounded_upper": false}
+```
+
+#### 9.3 零灵敏度 → 无上限区间（上界 null）
+
+模型 `y = 2*(a - a) + b` 中 a 对输出的名义点灵敏度恰为 0；a、b 独立，b = 2.0(20)，目标 0.3：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/precision-budgets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_version": "budget-flat",
+    "input_name": "a",
+    "target": {"standard_uncertainty": 0.3, "unit": "dimensionless"}
+  }'
+```
+
+返回 `200`（**实际响应**）：方差与 ua 无关且 0.2 ≤ 0.3，故任意 ua ≥ 0 都可行，区间为 **[0, +∞)**，上界 `null`、`unbounded_upper=true`，当前值 `satisfied=true`：
+
+```json
+{
+  "sensitivity": {"coefficient": 0.0, "unit": "dimensionless/dimensionless"},
+  "current_combined_standard_uncertainty": {"value": 0.19999999999921, "unit": "dimensionless"},
+  "satisfied": true,
+  "interval": {"feasible": true, "lower": 0.0, "lower_inclusive": true,
+               "upper": null, "upper_inclusive": false, "unbounded_upper": true}
+}
+```
+
+若固定贡献本身已超标（同一模型目标改为 0.1），则无论 ua 取何值都无法达标，返回空区间。
+
+#### 9.4 拒绝场景
+
+| 场景 | 状态码 | 实际响应 |
+| --- | --- | --- |
+| 未知模型版本 | 404 | `{"error": "NotFoundError", "message": "模型版本 'x' 不存在", "status_code": 404}` |
+| 未知输入名 | 422 | `{"error": "RequestError", "message": "输入 'x' 未在模型版本 'budget-sum-rm1' 中登记，可选: ['a', 'b']", "status_code": 422}` |
+| 目标单位与输出量纲不符 | 422 | `{"error": "RequestError", "message": "目标单位 'meter' 与模型输出单位 'dimensionless' 量纲不兼容", "status_code": 422}` |
+| 目标为负数 | 422 | Pydantic 校验错误数组，`msg` 含「目标标准不确定度必须是非负有限数」 |
+| 目标为 NaN / Infinity | 422 | 同上（响应中的非有限输入值已净化为字符串，保证返回体本身是合法 JSON） |
+| 请求体缺字段 / 类型错 | 422 | Pydantic 校验错误数组 |
+
+反求接口是幂等只读的：连续重复调用返回完全一致的结果；调用前后 `GET /api/v1/evaluations` 的记录数不变，登记模型的输入标准不确定度也不被修改。反求之后仍可正常提交 `/api/v1/evaluations`（201/200 幂等语义不变）。
+
 ## 模型表达式白名单
 
 表达式在服务端经 Python AST 解析后**逐节点白名单校验**，不经过任何 `eval`：
@@ -596,7 +775,7 @@ pip install -r requirements.txt pytest httpx
 python -m pytest -q
 ```
 
-测试覆盖：表达式注入拒绝、单位换算与量纲校验、PSD 拒绝（< -1e-8）/舍入修复（[-1e-8,0)，保单位对角）/奇异接受（r=±1 零特征值）、r=±1 的 GUM 解析解 |ua+r·ub| 与 MC 同/反向传播、完全抵消退化为确定值、**小量级（u=1e-9）真实 ~1e-18 方差不被固定绝对阈值钳零（r=+1→2e-9、r=−1 不等→1e-9、r=−1 相等→0）及其 HTTP 登记/计算/幂等/查询/非法矩阵拒绝不落库**、MC 与线性高斯解析解对比、固定种子可复现、幂等与冲突、不收敛/NaN 不落库、查询接口等（46 个用例）。
+测试覆盖：表达式注入拒绝、单位换算与量纲校验、PSD 拒绝（< -1e-8）/舍入修复（[-1e-8,0)，保单位对角）/奇异接受（r=±1 零特征值）、r=±1 的 GUM 解析解 |ua+r·ub| 与 MC 同/反向传播、完全抵消退化为确定值、**小量级（u=1e-9）真实 ~1e-18 方差不被固定绝对阈值钳零（r=+1→2e-9、r=−1 不等→1e-9、r=−1 相等→0）及其 HTTP 登记/计算/幂等/查询/非法矩阵拒绝不落库**、MC 与线性高斯解析解对比、固定种子可复现、幂等与冲突、不收敛/NaN 不落库、查询接口、**精度反求二次不等式（负相关 r=−1→ua∈[1,3] 双侧有界、相关输入零端点开、零灵敏度→上界 null 无上限、无法达标→空区间、目标零/单位换算/未知版本/未知输入/量纲不符/负值/NaN/Inf 拒绝、只读不改模型不写记录不影响幂等与传播）**等（71 个用例）。
 
 ## 项目结构
 
@@ -604,11 +783,11 @@ python -m pytest -q
 .
 ├── app/
 │   ├── main.py          # FastAPI 路由、错误映射、生命周期
-│   ├── models.py        # Pydantic 请求模型与参数约束
+│   ├── models.py        # Pydantic 请求模型与参数约束（含精度反求请求）
 │   ├── expressions.py   # AST 白名单校验 + NumPy 求值
 │   ├── units.py         # Pint 单位换算、量纲推导、基本单位缩放
 │   ├── engine.py        # 相关矩阵、分布抽样、GUM、蒙特卡洛与收敛判据
-│   ├── services.py      # 模型登记、快照核对、计算管线编排
+│   ├── services.py      # 模型登记、快照核对、计算管线编排、精度反求二次不等式
 │   ├── storage.py       # SQLite（WAL、写锁、幂等插入）
 │   ├── errors.py        # 领域错误（统一 4xx 映射）
 │   └── config.py        # 环境变量配置
