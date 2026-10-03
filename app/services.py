@@ -18,11 +18,19 @@ from .engine import (
     build_correlation_matrix,
     run_gum,
     run_monte_carlo,
+    solve_budget_interval,
 )
 from .errors import ConflictError, ModelError, RequestError
 from .expressions import compile_expression
-from .models import EvaluationCreate, ModelCreate
-from .units import build_unit_context, format_dimensionality, get_registry, parse_unit, to_declared_magnitude
+from .models import EvaluationCreate, ModelCreate, PrecisionBudgetCreate
+from .units import (
+    build_unit_context,
+    format_dimensionality,
+    get_registry,
+    parse_unit,
+    to_declared_magnitude,
+    to_output_magnitude,
+)
 
 #: 模型版本 -> (CompiledExpression, UnitContext)；登记时构建，进程内复用
 _CONTEXT_CACHE: dict[str, tuple[Any, Any]] = {}
@@ -398,6 +406,85 @@ def submit_evaluation(req: EvaluationCreate) -> dict[str, Any]:
     out = stored["evaluation"]
     out["cached"] = stored["cached"]
     return out
+
+
+# ---------------------------------------------------------------------------
+# 测量精度反求（只读：不改模型、不写计算记录）
+# ---------------------------------------------------------------------------
+
+def solve_precision_budget(req: PrecisionBudgetCreate) -> dict[str, Any]:
+    """反解单个输入标准不确定度的可行区间，使 GUM 合成标准不确定度不超过目标。
+
+    读取不可变模型，沿用与正向传播完全相同的单位换算、相关矩阵校验与名义点
+    灵敏度；仅变动目标输入的标准不确定度，解二次不等式
+
+        u_c^2(x) = A x^2 + B x + C <= T^2,  x >= 0
+
+    其中 B 携带相关协方差项（负相关时产生下界而非单一上限）。本函数不修改
+    模型、不写入任何计算记录。
+    """
+    record = storage.get_model(req.model_version)  # 未知版本 -> 404
+    compiled, ctx = _get_context(req.model_version)
+
+    names = tuple(s["name"] for s in record["inputs"])
+    if req.input not in names:
+        raise RequestError(f"模型 {req.model_version!r} 中不存在输入量 {req.input!r}")
+    t = names.index(req.input)
+
+    # 目标换算到模型输出单位（量纲不符 -> 422；负值/非有限值已被请求模型拒绝）
+    target_out = to_output_magnitude(
+        req.target_standard_uncertainty, req.target_unit, parse_unit(record["output_unit"])
+    )
+
+    # 与正向计算相同的管线：基本单位空间名义点 + 相关矩阵校验 + GUM 一阶
+    x_decl = {s["name"]: s["value"] for s in record["inputs"]}
+    std_decl_map = {s["name"]: s["standard_uncertainty"] for s in record["inputs"]}
+    x_base = ctx.nominal_to_base(x_decl)
+    std_base_arr = np.array([ctx.std_to_base(std_decl_map)[name] for name in names], dtype=float)
+    zero_std = {name for name in names if std_decl_map[name] == 0.0}
+    corr = build_correlation_matrix(
+        names, [(p[0], p[1], float(p[2])) for p in record["correlations"]], zero_std
+    )
+    gum = run_gum(compiled, names, x_base, std_base_arr, corr, ctx)
+
+    # 在“输出单位 / 输入声明单位”空间求解，端点直接落在输入声明单位下
+    sens = np.array([gum.sensitivities[name] for name in names], dtype=float)
+    std_decl = np.array([std_decl_map[name] for name in names], dtype=float)
+    interval = solve_budget_interval(sens, std_decl, corr, t, target_out ** 2)
+
+    # 当前值是否达标（中心差分灵敏度的相对误差 ~1e-10，比较留 1e-9 相对容差）
+    meets = bool(gum.uc <= target_out * (1.0 + 1e-9))
+
+    # 存储的声明单位是 Pint 短格式（dimensionless 为空串），响应中还原为可读形式
+    input_unit = record["inputs"][t]["unit"] or "dimensionless"
+    return {
+        "model_version": req.model_version,
+        "input": req.input,
+        "output_unit": record["output_unit"],
+        "target": {
+            "standard_uncertainty": _f(req.target_standard_uncertainty),
+            "unit": req.target_unit,
+            "standard_uncertainty_in_output_unit": _f(target_out),
+        },
+        "current": {
+            "standard_uncertainty": _f(std_decl_map[req.input]),
+            "unit": input_unit,
+            "combined_standard_uncertainty": _f(gum.uc),
+            "meets_target": meets,
+        },
+        "sensitivity": {
+            "coefficient": _f(float(sens[t])),
+            "unit": f"{record['output_unit']}/{input_unit}",
+        },
+        "interval": {
+            "empty": interval.empty,
+            "lower": None if interval.lower is None else _f(interval.lower),
+            "lower_inclusive": interval.lower_inclusive,
+            "upper": None if interval.upper is None else _f(interval.upper),
+            "upper_inclusive": interval.upper_inclusive,
+            "unit": input_unit,
+        },
+    }
 
 
 def req_output_unit(record: dict[str, Any]) -> str:

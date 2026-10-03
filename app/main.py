@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import math
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import __version__, services, storage
 from .errors import DomainError
-from .models import EvaluationCreate, ModelCreate
+from .models import EvaluationCreate, ModelCreate, PrecisionBudgetCreate
 
 
 @asynccontextmanager
@@ -41,6 +44,27 @@ async def _domain_error_handler(_: Request, exc: DomainError) -> JSONResponse:
             "status_code": exc.status_code,
         },
     )
+
+
+def _json_safe(obj: Any) -> Any:
+    """把校验错误体中的非有限浮点与异常对象转成可 JSON 序列化的形式。"""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else repr(obj)
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if obj is None or isinstance(obj, (str, int, bool)):
+        return obj
+    return str(obj)
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    # 默认处理器直接序列化 exc.errors()；当非法输入本身是非有限浮点（如 NaN
+    # 目标值）时，错误体回显的输入值无法 JSON 序列化，会把干净的 422 变成 500。
+    # 这里先做无害化，保证非法请求始终返回 422（保持 {"detail": ...} 形状）。
+    return JSONResponse(status_code=422, content={"detail": _json_safe(exc.errors())})
 
 
 @app.get("/", tags=["meta"])
@@ -91,6 +115,21 @@ def create_evaluation(payload: EvaluationCreate) -> JSONResponse:
     cached = result.get("cached", False)
     # 去重命中返回 200；首次计算返回 201
     return JSONResponse(status_code=200 if cached else 201, content=result)
+
+
+# ---------------------------------------------------------------------------
+# 测量精度反求
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/precision-budgets", tags=["precision-budgets"])
+def create_precision_budget(payload: PrecisionBudgetCreate) -> dict:
+    """测量精度反求：仅变动一个输入的标准不确定度，反解使 GUM 合成标准不确定度
+    不超过目标的可行区间（输入声明单位下的端点及开闭性、当前值是否达标）。
+
+    相关协方差进入二次不等式（负相关产生下界）；只读接口——不修改模型、
+    不写入计算记录。
+    """
+    return services.solve_precision_budget(payload)
 
 
 @app.get("/api/v1/evaluations/{evaluation_id}", tags=["evaluations"])

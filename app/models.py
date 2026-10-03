@@ -80,6 +80,19 @@ class EvaluationCreate(BaseModel):
     )
 
 
+class PrecisionBudgetCreate(BaseModel):
+    """测量精度反求请求：仅变动一个输入的标准不确定度，反解达标可行区间。"""
+
+    model_version: str = Field(min_length=1, max_length=128)
+    input: str = Field(min_length=1, max_length=64, description="待调整的输入量名称")
+    target_standard_uncertainty: float = Field(
+        ge=0.0,
+        allow_inf_nan=False,
+        description="目标 GUM 合成标准不确定度（非负、有限，单位由 target_unit 给出）",
+    )
+    target_unit: str = Field(min_length=1, max_length=64)
+
+
 __all__ = [
     "Distribution",
     "InputSpec",
@@ -87,5 +100,6 @@ __all__ = [
     "ModelCreate",
     "SnapshotInput",
     "EvaluationCreate",
+    "PrecisionBudgetCreate",
     "DISTRIBUTIONS",
 ]

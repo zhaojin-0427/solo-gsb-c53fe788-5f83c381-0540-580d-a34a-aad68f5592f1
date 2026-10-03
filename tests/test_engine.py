@@ -321,3 +321,65 @@ def test_three_way_perfect_correlation_singular_block():
     assert mc.converged, mc.nonconvergence_reasons
     # 完全同向：y 的标准差 = ua + ub + uc
     assert abs(mc.std - 0.6) < 1e-2
+
+
+# ---------------------------------------------------------------------------
+# 精度反求：二次不等式求解器
+# ---------------------------------------------------------------------------
+
+def test_solve_budget_interval_negative_correlation_has_lower_bound():
+    # y=a+b、r=-1、ub=2、目标方差 1 -> (ua-2)^2 <= 1 -> ua ∈ [1, 3]
+    # 负相关产生下界，绝不能误算成单一上限
+    from app.engine import solve_budget_interval
+    sens = np.array([1.0, 1.0])
+    std = np.array([0.1, 2.0])
+    corr = np.array([[1.0, -1.0], [-1.0, 1.0]])
+    iv = solve_budget_interval(sens, std, corr, 0, 1.0)
+    assert not iv.empty
+    assert abs(iv.lower - 1.0) < 1e-12 and abs(iv.upper - 3.0) < 1e-12
+    assert iv.lower_inclusive and iv.upper_inclusive
+
+
+def test_solve_budget_interval_zero_endpoint_openness():
+    from app.engine import solve_budget_interval
+    sens = np.array([1.0, 1.0])
+    std = np.array([0.1, 0.2])
+    # 相关输入：零端点开
+    corr = np.eye(2)
+    corr[0, 1] = corr[1, 0] = 1.0
+    iv = solve_budget_interval(sens, std, corr, 0, 1.0)
+    assert not iv.empty and iv.lower == 0.0 and iv.lower_inclusive is False
+    assert abs(iv.upper - 0.8) < 1e-12 and iv.upper_inclusive
+    # 不相关输入：零端点闭
+    iv = solve_budget_interval(sens, std, np.eye(2), 0, 1.0)
+    assert not iv.empty and iv.lower == 0.0 and iv.lower_inclusive is True
+    assert abs(iv.upper - math.sqrt(0.96)) < 1e-12
+
+
+def test_solve_budget_interval_zero_sensitivity_unbounded_or_empty():
+    from app.engine import solve_budget_interval
+    sens = np.array([0.0, 2.0])  # 目标输入零灵敏度
+    std = np.array([0.1, 0.5])   # C = (2*0.5)^2 = 1
+    corr = np.eye(2)
+    iv = solve_budget_interval(sens, std, corr, 0, 1.5 ** 2)
+    assert not iv.empty and iv.lower == 0.0 and iv.upper is None
+    iv = solve_budget_interval(sens, std, corr, 0, 0.5 ** 2)
+    assert iv.empty and iv.lower is None and iv.upper is None
+
+
+def test_solve_budget_interval_infeasible_and_tangent():
+    from app.engine import solve_budget_interval
+    sens = np.array([1.0, 1.0])
+    std = np.array([0.1, 2.0])
+    corr = np.eye(2)
+    # u_c^2 = ua^2 + 4 > 1 恒成立 -> 空
+    assert solve_budget_interval(sens, std, corr, 0, 1.0).empty
+    # 相切：目标恰为最小可达方差 -> 退化区间 [2, 2]
+    corr_m1 = np.array([[1.0, -1.0], [-1.0, 1.0]])
+    iv = solve_budget_interval(sens, std, corr_m1, 0, 0.0)
+    assert not iv.empty
+    assert abs(iv.lower - 2.0) < 1e-9 and abs(iv.upper - 2.0) < 1e-9
+    # 相关输入唯一可行点为 0 -> 空（零端点无效）
+    corr_p1 = np.array([[1.0, 1.0], [1.0, 1.0]])
+    iv = solve_budget_interval(sens, std, corr_p1, 0, 4.0)
+    assert iv.empty

@@ -374,6 +374,99 @@ def run_gum(
 
 
 # ---------------------------------------------------------------------------
+# 精度反求（预算反解）
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class BudgetInterval:
+    """单个输入标准不确定度的可行区间（该输入声明单位下的数值）。
+
+    * ``empty`` 为 True：无法达标（可行集为空），端点为 None；
+    * ``upper`` 为 None：无上限（零灵敏度——合成方差与该输入无关）；
+    * ``lower_inclusive`` / ``upper_inclusive``：端点开闭性。
+    """
+
+    empty: bool
+    lower: float | None
+    lower_inclusive: bool
+    upper: float | None
+    upper_inclusive: bool
+
+
+def solve_budget_interval(
+    sens: np.ndarray,
+    std: np.ndarray,
+    corr: np.ndarray,
+    target_index: int,
+    target_var: float,
+) -> BudgetInterval:
+    """反解第 ``target_index`` 个输入的标准不确定度 x >= 0，使合成方差 <= ``target_var``。
+
+    其余输入保持登记值，灵敏度与相关结构沿用名义点一阶线性化，合成方差
+    是 x 的二次函数（各量在同一组单位下：灵敏度为 输出单位/输入声明单位，
+    标准不确定度为输入声明单位，目标方差为输出单位平方）：
+
+        u_c^2(x) = A x^2 + B x + C
+        A = s_t^2
+        B = 2 s_t Σ_{j≠t} s_j r_tj u_j      （相关协方差项；负相关时 B < 0）
+        C = Σ_{i,j≠t} s_i s_j r_ij u_i u_j  （其余输入的合成方差）
+
+    负相关（B < 0）时抛物线先降后升，可行区间形如 [x_lo, x_hi]，存在下界——
+    绝不能把负相关误算成只有单一上限。例如 y=a+b、r=-1、ub=2、目标 uc<=1
+    时 (ua-2)^2 <= 1，可行区间为 [1, 3]。
+    """
+    n = len(sens)
+    t = target_index
+    mask = np.ones(n, dtype=bool)
+    mask[t] = False
+    g_t = float(sens[t])
+    a_coef = g_t * g_t
+    b_coef = 2.0 * g_t * float(np.sum(sens[mask] * corr[t][mask] * std[mask]))
+    cov_sub = std[mask][:, None] * corr[np.ix_(mask, mask)] * std[mask][None, :]
+    # 子协方差矩阵半正定 => C >= 0；浮点可能留下微小负值，钳到 0
+    c_coef = max(float(sens[mask] @ cov_sub @ sens[mask]), 0.0)
+    # 该输入是否参与相关（决定零端点是否有效：相关系数在 u=0 处无定义）
+    correlated = bool(np.any(corr[t][mask] != 0.0))
+
+    def _empty() -> BudgetInterval:
+        return BudgetInterval(empty=True, lower=None, lower_inclusive=False,
+                              upper=None, upper_inclusive=False)
+
+    if a_coef == 0.0:
+        # 零灵敏度：合成方差与该输入无关，要么任意 x 都达标（无上限），要么空
+        if c_coef <= target_var:
+            return BudgetInterval(empty=False, lower=0.0, lower_inclusive=not correlated,
+                                  upper=None, upper_inclusive=False)
+        return _empty()
+
+    disc = b_coef * b_coef - 4.0 * a_coef * (c_coef - target_var)
+    disc_scale = b_coef * b_coef + 4.0 * a_coef * abs(c_coef - target_var)
+    if disc < 0.0:
+        if disc < -64.0 * _EPS * disc_scale:
+            return _empty()  # 抛物线整体高于目标：无法达标
+        disc = 0.0  # 相切点的舍入抖动
+    root = math.sqrt(disc)
+    x_lo = (-b_coef - root) / (2.0 * a_coef)
+    x_hi = (-b_coef + root) / (2.0 * a_coef)
+
+    root_scale = (abs(b_coef) + root) / (2.0 * a_coef)
+    x_tol = 64.0 * _EPS * root_scale
+    if x_hi < 0.0:
+        if x_hi < -x_tol:
+            return _empty()  # 两个根均为负：x >= 0 上处处超标
+        x_hi = 0.0
+    lower = max(x_lo, 0.0)
+    if lower == 0.0 and x_hi == 0.0 and correlated:
+        # 唯一可行点 x = 0，但参与相关的输入标准不确定度不能为 0（相关系数无定义）
+        return _empty()
+    # x_lo > 0 时下端点是方程的根（闭）；下端点被钳到 0 时，仅当该输入不参与
+    # 相关（u=0 是合法模型状态）才为闭，否则零端点无效须标为开。
+    lower_inclusive = True if x_lo > 0.0 else not correlated
+    return BudgetInterval(empty=False, lower=lower, lower_inclusive=lower_inclusive,
+                          upper=x_hi, upper_inclusive=True)
+
+
+# ---------------------------------------------------------------------------
 # 蒙特卡洛
 # ---------------------------------------------------------------------------
 

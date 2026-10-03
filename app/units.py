@@ -54,6 +54,19 @@ def to_declared_magnitude(value: float, unit_spec: str, declared: pint.Unit) -> 
     return float(q.magnitude)
 
 
+def to_output_magnitude(value: float, unit_spec: str, output: pint.Unit) -> float:
+    """把目标值 ``value <unit_spec>`` 换算到模型输出单位；量纲不兼容 -> RequestError。"""
+    reg = get_registry()
+    src = parse_unit(unit_spec)
+    try:
+        q = reg.Quantity(float(value), src).to(output)
+    except pint.errors.DimensionalityError as exc:
+        raise RequestError(
+            f"目标单位 {unit_spec!r} 与模型输出单位 {f'{output:~}' or 'dimensionless'} 量纲不兼容"
+        ) from exc
+    return float(q.magnitude)
+
+
 def base_factor(unit: pint.Unit) -> float:
     """1 个声明单位 = 多少个 SI 基本单位下的数值。"""
     reg = get_registry()
